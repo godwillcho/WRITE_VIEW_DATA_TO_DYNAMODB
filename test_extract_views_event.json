@@ -1,0 +1,26 @@
+{
+  "InstanceId": "a8fab42a-42a6-446d-b8fc-31ea25332f07",
+  "ViewArns": [
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/dccede29-3656-4129-b1c3-3019e7ad4caa",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/2672f3e5-e692-4460-aec9-ac0711303b26",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/e44ab02c-fb85-4a15-b0d8-ed2d5e3134b6",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/3955d2bd-fdf4-48da-b03a-048f76c7b66a",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/782ca502-9a54-4358-91b9-4b7fa1e76bce",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/62982f57-d028-4dff-84c2-ed646e91d3f2",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/f0ab8846-53f8-40aa-afb9-de9fd88110a1",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/d3d46050-80d5-4248-981c-854aac7b4b7f",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/0d0aa32e-2123-44b4-be9f-7d0351a51f54",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/388c8286-658b-4729-9218-95841f99a26b",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/66b89bfa-5de9-47ca-b7bf-55820fd20cb7",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/9131c9b1-7b06-44a4-9b5d-1893e8ba834b",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/3ee5f75a-e0eb-492a-954e-7c3e66096c2d",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/bea229ba-cb9d-40dd-9c94-3b0b34a6358a",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/b9f472e6-9286-492f-9527-63a87c6e77d6",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/797cd882-893d-4720-ab09-f39cc4832c0f",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/5b2a5028-fe4b-472c-af6f-89cd74a32bf5",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/b91b1fee-e3ca-4d42-84b7-a56c244b240e",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/ff0e8bd9-e702-4b6e-979b-f024440dd189",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/adc4dc75-4e82-4084-8774-ae7498d467e5",
+    "arn:aws:connect:us-west-2:551642657889:instance/a8fab42a-42a6-446d-b8fc-31ea25332f07/view/ff1f32b2-69aa-4d07-b941-c9ffeb0da44e"
+  ]
+}

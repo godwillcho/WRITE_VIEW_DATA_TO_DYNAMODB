@@ -1,0 +1,862 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Amazon Connect View utilities.  (1) Normalize View result data and write
+  enriched contact records to DynamoDB.  (2) Extract questions/labels from
+  Views and store in a separate DynamoDB table.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  ConnectInstanceArn:
+    Type: String
+    Description: ARN of the Amazon Connect instance (e.g. arn:aws:connect:us-east-1:123456789012:instance/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+    AllowedPattern: "arn:aws:connect:[a-z0-9-]+:[0-9]{12}:instance/[a-f0-9-]+"
+
+  DynamoDBTableName:
+    Type: String
+    Default: ConnectViewData
+    Description: Name of the DynamoDB table to create.
+
+  PartitionKeyName:
+    Type: String
+    Default: InitialContactId
+    Description: Name of the partition key attribute on the DynamoDB table.
+
+  TZOffsetHours:
+    Type: Number
+    Default: -5
+    MinValue: -12
+    MaxValue: 14
+    Description: UTC offset in hours for the CreatedAt timestamp (e.g. -5 for EST, -8 for PST).
+
+  TZLabel:
+    Type: String
+    Default: EST
+    Description: Label appended to the CreatedAt timestamp (e.g. EST, PST, UTC).
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Lambda log level.
+
+  ScheduleExpression:
+    Type: String
+    Default: "rate(30 days)"
+    Description: EventBridge Scheduler expression for ExtractViewQuestions (e.g. "rate(1 day)", "cron(0 8 * * ? *)").
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ---- DynamoDB Table ----
+  ViewDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: !Ref PartitionKeyName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: !Ref PartitionKeyName
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ---- IAM Role for Lambda ----
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${DynamoDBTableName}-LambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ViewDataTable.Arn
+        - PolicyName: ViewQuestionsReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !GetAtt ViewQuestionsTable.Arn
+        - PolicyName: ConnectReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:DescribeContact
+                  - connect:DescribeUser
+                Resource:
+                  - !Sub "${ConnectInstanceArn}/contact/*"
+                  - !Sub "${ConnectInstanceArn}/agent/*"
+        - PolicyName: CampaignsReadPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect-campaigns:DescribeCampaign
+                Resource: "*"
+
+  # ---- Lambda Function (inline) ----
+  NormalizeViewDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${DynamoDBTableName}-NormalizeViewData"
+      Description: Normalize Amazon Connect View result data and write to DynamoDB.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 15
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DDB_TABLE_NAME: !Ref DynamoDBTableName
+          DDB_PK_NAME: !Ref PartitionKeyName
+          VIEW_QUESTIONS_TABLE: !Ref ViewQuestionsTable
+          TZ_OFFSET_HOURS: !Ref TZOffsetHours
+          TZ_LABEL: !Ref TZLabel
+          LOG_LEVEL: !Ref LogLevel
+      Code:
+        ZipFile: |
+          """
+          Lambda Function: Normalize View Result Data for Amazon Connect
+
+          Converts multi-select answers in Details.Parameters.viewResultData into a
+          single comma-separated string (e.g., {"0":"A","1":"B"} -> "A, B"), while
+          leaving scalars unchanged.
+
+          Writes enriched contact records to DynamoDB including contact IDs, endpoints,
+          flow metadata, agent info, timestamps, and campaign data.
+          """
+
+          import os
+          import logging
+          import time
+          from datetime import datetime, timezone, timedelta
+          from typing import Any, Dict, List
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # ---------- Logging (non-sensitive) ----------
+          logger = logging.getLogger(__name__)
+          if not logger.handlers:
+              handler = logging.StreamHandler()
+              handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
+              logger.addHandler(handler)
+          logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+          # ---------- DynamoDB (config via env) ----------
+          _DDB_TABLE = os.getenv("DDB_TABLE_NAME")
+          _DDB_PK = os.getenv("DDB_PK_NAME")
+          _DDB_TTL_ATTR = "ttl"
+          try:
+              _DDB_TZ_OFFSET = int(os.getenv("TZ_OFFSET_HOURS", "-5"))
+          except ValueError:
+              _DDB_TZ_OFFSET = -5
+          _DDB_TZ_LABEL = os.getenv("TZ_LABEL", "EST")
+          _VQ_TABLE = os.getenv("VIEW_QUESTIONS_TABLE")
+          _dynamodb = boto3.resource("dynamodb") if _DDB_TABLE and _DDB_PK else None
+          _connect_client = boto3.client("connect")
+          _campaigns_client = boto3.client("connectcampaigns")
+
+
+          def normalize_view_value(raw_value: Any) -> Any:
+              """Convert multi-select values into a single comma-separated string."""
+              if isinstance(raw_value, dict) and all(str(k).isdigit() for k in raw_value.keys()):
+                  ordered_items: List[Any] = [raw_value[k] for k in sorted(raw_value.keys(), key=lambda x: int(x))]
+                  return ", ".join(map(str, ordered_items))
+              if isinstance(raw_value, list):
+                  return ", ".join(map(str, raw_value))
+              return raw_value
+
+
+          def _get_contact_details(instance_arn: str, contact_id: str) -> Dict[str, Any]:
+              """Follow RelatedContactId chain to find the original VOICE contact,
+              then extract agent info, timestamps, channel, and campaign data."""
+              result: Dict[str, Any] = {}
+              try:
+                  instance_id = instance_arn.split("/")[-1]
+
+                  # Follow the RelatedContactId chain to find the original VOICE contact (max 5 hops)
+                  current_id = contact_id
+                  contact = {}
+                  for hop in range(5):
+                      contact_resp = _connect_client.describe_contact(
+                          InstanceId=instance_id,
+                          ContactId=current_id,
+                      )
+                      contact = contact_resp.get("Contact", {})
+                      channel = contact.get("Channel", "")
+                      logger.info("Chain hop %d: contact=%s channel=%s", hop, current_id, channel)
+
+                      if channel == "VOICE":
+                          break  # Found the original voice contact
+
+                      next_related = contact.get("RelatedContactId")
+                      if not next_related or next_related == current_id:
+                          break  # No more related contacts to follow
+                      current_id = next_related
+
+                  # Store which contact we extracted details from and its channel
+                  result["DescribedContactId"] = current_id
+                  channel = contact.get("Channel")
+                  if channel:
+                      result["OriginalContactChannel"] = channel
+
+                  # --- Timestamps (convert datetime objects to ISO strings) ---
+                  timestamp_fields = [
+                      "InitiationTimestamp",
+                      "DisconnectTimestamp",
+                      "ConnectedToSystemTimestamp",
+                      "LastUpdateTimestamp",
+                      "LastPausedTimestamp",
+                      "LastResumedTimestamp",
+                      "ScheduledTimestamp",
+                  ]
+                  for ts_field in timestamp_fields:
+                      ts_val = contact.get(ts_field)
+                      if ts_val:
+                          result[ts_field] = ts_val.isoformat() if hasattr(ts_val, "isoformat") else str(ts_val)
+
+                  # Agent-level timestamps
+                  agent_info = contact.get("AgentInfo", {}) or {}
+                  agent_ts_fields = [
+                      "ConnectedToAgentTimestamp",
+                      "AcceptedByAgentTimestamp",
+                      "AfterContactWorkStartTimestamp",
+                      "AfterContactWorkEndTimestamp",
+                  ]
+                  for ts_field in agent_ts_fields:
+                      ts_val = agent_info.get(ts_field)
+                      if ts_val:
+                          result[ts_field] = ts_val.isoformat() if hasattr(ts_val, "isoformat") else str(ts_val)
+
+                  # Queue enqueue timestamp
+                  queue_info = contact.get("QueueInfo", {}) or {}
+                  enqueue_ts = queue_info.get("EnqueueTimestamp")
+                  if enqueue_ts:
+                      result["EnqueueTimestamp"] = enqueue_ts.isoformat() if hasattr(enqueue_ts, "isoformat") else str(enqueue_ts)
+
+                  # --- Agent identity ---
+                  agent_id = agent_info.get("Id")
+                  if agent_id:
+                      result["AgentId"] = agent_id
+                      try:
+                          user_resp = _connect_client.describe_user(
+                              InstanceId=instance_id,
+                              UserId=agent_id,
+                          )
+                          identity = user_resp.get("User", {}).get("IdentityInfo", {})
+                          first_name = identity.get("FirstName", "")
+                          last_name = identity.get("LastName", "")
+                          if first_name or last_name:
+                              result["AgentName"] = f"{first_name} {last_name}".strip()
+                          username = user_resp.get("User", {}).get("Username")
+                          if username:
+                              result["AgentUsername"] = username
+                      except Exception as e:
+                          logger.error("describe_user failed: %s: %s", type(e).__name__, str(e))
+                  else:
+                      logger.info("No agent assigned to contact %s.", current_id)
+
+                  # --- Campaign info ---
+                  campaign = contact.get("Campaign", {}) or {}
+                  campaign_id = campaign.get("CampaignId")
+                  if campaign_id:
+                      result["CampaignId"] = campaign_id
+                      try:
+                          camp_resp = _campaigns_client.describe_campaign(id=campaign_id)
+                          camp_name = camp_resp.get("campaign", {}).get("name")
+                          if camp_name:
+                              result["CampaignName"] = camp_name
+                      except Exception as e:
+                          logger.error("describe_campaign failed: %s: %s", type(e).__name__, str(e))
+
+                  logger.info("describe_contact success: described=%s channel=%s fields=%d",
+                               current_id, contact.get("Channel"), len(result))
+
+              except ClientError as e:
+                  logger.error("describe_contact ClientError: %s: %s", type(e).__name__, str(e))
+              except Exception as e:
+                  logger.error("describe_contact failed: %s: %s", type(e).__name__, str(e))
+
+              return result
+
+
+          def _write_to_dynamodb(item: Dict[str, Any]) -> None:
+              """Write item to DynamoDB with PK = InitialContactId plus contact attributes and 1-year TTL."""
+              if not _dynamodb:
+                  logger.info("DynamoDB not configured: skipping write (missing DDB_TABLE_NAME or DDB_PK_NAME).")
+                  return
+
+              try:
+                  table = _dynamodb.Table(_DDB_TABLE)
+                  table.put_item(Item=item)
+                  logger.info("DynamoDB write success: table=%s pk=%s ttl_days=365",
+                              _DDB_TABLE, item.get(_DDB_PK, "unknown"))
+              except ClientError as e:
+                  logger.error("DynamoDB ClientError: %s: %s", type(e).__name__, str(e))
+              except Exception as e:
+                  logger.error("DynamoDB write failed: %s: %s", type(e).__name__, str(e))
+
+
+          def lambda_handler(event, context):
+              """Normalize multi-select answers in viewResultData for use in Amazon Connect flows."""
+              try:
+                  event_details: Dict[str, Any] = event.get("Details", {}) or {}
+                  parameters: Dict[str, Any] = event_details.get("Parameters", {}) or {}
+
+                  view_result_data: Dict[str, Any] = parameters.get("viewResultData", {}) or {}
+                  view_action: str = parameters.get("viewAction", "") or ""
+
+                  key_count = len(view_result_data)
+                  logger.info("Normalization start: keys=%d, action_present=%s", key_count, bool(view_action))
+
+                  normalized_attributes: Dict[str, Any] = {}
+                  per_key_errors = 0
+
+                  for answer_key, raw_answer_value in view_result_data.items():
+                      try:
+                          is_numeric_dict = isinstance(raw_answer_value, dict) and all(str(k).isdigit() for k in raw_answer_value.keys())
+                          is_list = isinstance(raw_answer_value, list)
+                          classification = "numeric_dict" if is_numeric_dict else ("list" if is_list else "scalar")
+                          logger.debug("Normalizing key='%s' type=%s", answer_key, classification)
+
+                          normalized_attributes[answer_key] = normalize_view_value(raw_answer_value)
+
+                      except Exception as key_error:
+                          per_key_errors += 1
+                          logger.error("Normalization failed for key='%s': %s: %s",
+                                       answer_key, type(key_error).__name__, str(key_error))
+                          normalized_attributes[answer_key] = raw_answer_value
+
+                  if view_action:
+                      normalized_attributes["viewAction"] = view_action
+
+                  logger.info("Normalization complete: normalized_keys=%d, key_errors=%d",
+                              len(normalized_attributes), per_key_errors)
+
+                  # --- Write to DynamoDB ---
+                  contact_data: Dict[str, Any] = event_details.get("ContactData", {}) or {}
+                  initial_contact_id = contact_data.get("InitialContactId")
+
+                  if initial_contact_id:
+                      ttl_value = int(time.time()) + 365 * 24 * 3600  # 1 year from now
+
+                      item: Dict[str, Any] = {
+                          _DDB_PK: initial_contact_id,
+                          _DDB_TTL_ATTR: ttl_value,
+                      }
+
+                      # Spread normalized attributes as top-level DynamoDB attributes
+                      item.update(normalized_attributes)
+
+                      # Add optional contact attributes (only written if present and non-None)
+                      optional_fields = {
+                          "ContactId":              contact_data.get("ContactId"),
+                          "PreviousContactId":      contact_data.get("PreviousContactId"),
+                          "RelatedContactId":       contact_data.get("RelatedContactId"),
+                          "CustomerEndpointAddress": contact_data.get("CustomerEndpoint", {}).get("Address"),
+                          "InitiationMethod":       contact_data.get("InitiationMethod"),
+                          "Channel":                contact_data.get("Channel"),
+                          "QueueName":              contact_data.get("Queue", {}).get("Name") if contact_data.get("Queue") else None,
+                          "SystemEndpointAddress":  contact_data.get("SystemEndpoint", {}).get("Address") if contact_data.get("SystemEndpoint") else None,
+                          "OutboundCallerId":       contact_data.get("Queue", {}).get("OutboundCallerId") if contact_data.get("Queue") else None,
+                      }
+                      for attr_name, attr_value in optional_fields.items():
+                          if attr_value:
+                              item[attr_name] = attr_value
+
+                      # Human-readable timestamp in configured timezone
+                      tz = timezone(timedelta(hours=_DDB_TZ_OFFSET))
+                      item["CreatedAt"] = datetime.now(tz).strftime(f"%B %d, %Y %I:%M:%S %p {_DDB_TZ_LABEL}")
+
+                      # Lookup agent info, timestamps, campaign, and channel from the related contact (original voice call)
+                      instance_arn = contact_data.get("InstanceARN")
+                      related_contact_id = contact_data.get("RelatedContactId")
+                      if instance_arn and related_contact_id:
+                          contact_details = _get_contact_details(instance_arn, related_contact_id)
+                          item.update(contact_details)
+
+                      # Lookup question text for each normalized key from ViewQuestions table
+                      if _VQ_TABLE and _dynamodb:
+                          vq_table = _dynamodb.Table(_VQ_TABLE)
+                          for attr_key in list(normalized_attributes.keys()):
+                              if attr_key == "viewAction":
+                                  continue
+                              try:
+                                  resp = vq_table.query(
+                                      KeyConditionExpression="#n = :name",
+                                      ExpressionAttributeNames={"#n": "Name"},
+                                      ExpressionAttributeValues={":name": attr_key},
+                                      Limit=1,
+                                  )
+                                  vq_items = resp.get("Items", [])
+                                  if vq_items:
+                                      question_label = vq_items[0].get("Label", "")
+                                      if question_label:
+                                          item[f"{attr_key}_Question"] = question_label
+                              except Exception as e:
+                                  logger.error("ViewQuestions query failed for key=%s: %s: %s",
+                                               attr_key, type(e).__name__, str(e))
+
+                      _write_to_dynamodb(item)
+                  else:
+                      logger.warning("InitialContactId not found in event; skipping DynamoDB write.")
+
+                  return normalized_attributes
+
+              except Exception as fatal_error:
+                  logger.error("Fatal error during normalization: %s: %s",
+                               type(fatal_error).__name__, str(fatal_error))
+                  raise
+
+  # ====================================================================
+  # Extract View Questions — DynamoDB Table, IAM Role, Lambda
+  # ====================================================================
+
+  # ---- DynamoDB Table for View Questions ----
+  ViewQuestionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: Name
+          AttributeType: S
+        - AttributeName: Label
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Name
+          KeyType: HASH
+        - AttributeName: Label
+          KeyType: RANGE
+
+  # ---- IAM Role for Extract View Questions Lambda ----
+  ExtractViewQuestionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${DynamoDBTableName}-ExtractViewQuestionsRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBWritePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ViewQuestionsTable.Arn
+        - PolicyName: ConnectDescribeViewPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:DescribeView
+                Resource:
+                  - !Sub "${ConnectInstanceArn}/view/*"
+        - PolicyName: ConnectListViewsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:ListViews
+                Resource:
+                  - !Ref ConnectInstanceArn
+
+  # ---- Lambda Function: Extract View Questions (inline) ----
+  ExtractViewQuestionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${DynamoDBTableName}-ExtractViewQuestions"
+      Description: Extract questions/labels from Amazon Connect Views and write to DynamoDB.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt ExtractViewQuestionsRole.Arn
+      Environment:
+        Variables:
+          DDB_TABLE_NAME: !Ref ViewQuestionsTable
+          DDB_PK_NAME: Name
+          DDB_SK_NAME: Label
+          TZ_OFFSET_HOURS: !Ref TZOffsetHours
+          TZ_LABEL: !Ref TZLabel
+          LOG_LEVEL: !Ref LogLevel
+      Code:
+        ZipFile: |
+          """
+          Lambda: Extract Questions/Labels from Amazon Connect Views.
+
+          Event format:
+          {
+            "InstanceId": "optional-override",
+            "ViewArns": ["arn:aws:connect:.../view/VIEW_ID", ...]
+          }
+          """
+
+          import os
+          import logging
+          import json
+          from datetime import datetime, timezone, timedelta
+          from typing import Any, Dict, List
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger(__name__)
+          if not logger.handlers:
+              handler = logging.StreamHandler()
+              handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
+              logger.addHandler(handler)
+          logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
+
+          _DDB_TABLE = os.getenv("DDB_TABLE_NAME")
+          _DDB_PK = os.getenv("DDB_PK_NAME", "Name")
+          _DDB_SK = os.getenv("DDB_SK_NAME", "Label")
+          try:
+              _TZ_OFFSET = int(os.getenv("TZ_OFFSET_HOURS", "-5"))
+          except ValueError:
+              _TZ_OFFSET = -5
+          _TZ_LABEL = os.getenv("TZ_LABEL", "EST")
+
+          _dynamodb = boto3.resource("dynamodb") if _DDB_TABLE else None
+          _connect_client = boto3.client("connect")
+
+
+          def extract_name_label_pairs(data: Any) -> List[Dict[str, str]]:
+              """Recursively walk the View template and collect Name+Label pairs.
+              Only collects from dicts that have their own Name key (questions only)."""
+              pairs: List[Dict[str, str]] = []
+              if isinstance(data, dict):
+                  name = data.get("Name") or data.get("name")
+                  label = None
+                  for key in ("Label", "label"):
+                      if key in data and isinstance(data[key], str):
+                          label = data[key]
+                          break
+                  if name and label:
+                      pairs.append({"Name": name, "Label": label})
+                  for value in data.values():
+                      pairs.extend(extract_name_label_pairs(value))
+              elif isinstance(data, list):
+                  for item in data:
+                      pairs.extend(extract_name_label_pairs(item))
+              return pairs
+
+
+          def _parse_view_arn(view_arn: str) -> Dict[str, str]:
+              """Extract InstanceId and ViewId from a View ARN."""
+              parts = view_arn.split("/")
+              instance_id = parts[1] if len(parts) >= 2 else ""
+              view_id = parts[3] if len(parts) >= 4 else ""
+              return {"instance_id": instance_id, "view_id": view_id}
+
+
+          def _write_to_dynamodb(item: Dict[str, Any]) -> None:
+              """Write a single item to DynamoDB."""
+              if not _dynamodb:
+                  logger.info("DynamoDB not configured: skipping write.")
+                  return
+              try:
+                  table = _dynamodb.Table(_DDB_TABLE)
+                  table.put_item(Item=item)
+                  logger.info("DynamoDB write success: table=%s pk=%s",
+                              _DDB_TABLE, item.get(_DDB_PK, "unknown"))
+              except ClientError as e:
+                  logger.error("DynamoDB ClientError: %s: %s", type(e).__name__, str(e))
+              except Exception as e:
+                  logger.error("DynamoDB write failed: %s: %s", type(e).__name__, str(e))
+
+
+          def _list_view_arns(instance_id: str) -> List[str]:
+              """Call connect:ListViews and return all View ARNs."""
+              arns: List[str] = []
+              next_token = None
+              while True:
+                  kwargs: Dict[str, Any] = {"InstanceId": instance_id}
+                  if next_token:
+                      kwargs["NextToken"] = next_token
+                  resp = _connect_client.list_views(**kwargs)
+                  for vs in resp.get("ViewsSummaryList", []):
+                      arn = vs.get("Arn")
+                      if arn:
+                          arns.append(arn)
+                  next_token = resp.get("NextToken")
+                  if not next_token:
+                      break
+              return arns
+
+
+          def lambda_handler(event, context):
+              """Process a list of View ARNs: extract questions and write to DynamoDB."""
+              view_arns: List[str] = event.get("ViewArns", [])
+              instance_id_override: str = event.get("InstanceId", "")
+
+              # Auto-discover views when ViewArns is not provided
+              if not view_arns and instance_id_override:
+                  logger.info("No ViewArns provided; discovering views for instance %s.", instance_id_override)
+                  view_arns = _list_view_arns(instance_id_override)
+                  logger.info("Discovered %d view(s).", len(view_arns))
+
+              if not view_arns:
+                  logger.warning("No ViewArns provided or discovered.")
+                  return {"processed": 0, "errors": 0}
+
+              logger.info("Processing %d view(s).", len(view_arns))
+
+              tz = timezone(timedelta(hours=_TZ_OFFSET))
+              processed = 0
+              errors = 0
+
+              for view_arn in view_arns:
+                  try:
+                      parsed = _parse_view_arn(view_arn)
+                      instance_id = instance_id_override or parsed["instance_id"]
+                      view_id = parsed["view_id"]
+
+                      if not instance_id or not view_id:
+                          logger.error("Could not parse InstanceId/ViewId from ARN: %s", view_arn)
+                          errors += 1
+                          continue
+
+                      response = _connect_client.describe_view(
+                          InstanceId=instance_id,
+                          ViewId=view_id,
+                      )
+                      view = response.get("View", {})
+
+                      template_str = view.get("Content", {}).get("Template", "{}")
+                      if isinstance(template_str, str):
+                          view_content = json.loads(template_str)
+                      else:
+                          view_content = template_str
+
+                      pairs = extract_name_label_pairs(view_content)
+                      created_at = datetime.now(tz).strftime(f"%B %d, %Y %I:%M:%S %p {_TZ_LABEL}")
+
+                      view_name = view.get("Name")
+                      view_status = view.get("Status")
+                      view_description = view.get("Description")
+
+                      for pair in pairs:
+                          item: Dict[str, Any] = {
+                              _DDB_PK: pair["Name"],
+                              _DDB_SK: pair["Label"],
+                              "ViewId": view_id,
+                              "ViewArn": view_arn,
+                              "CreatedAt": created_at,
+                          }
+                          if view_name:
+                              item["ViewName"] = view_name
+                          if view_status:
+                              item["ViewStatus"] = view_status
+                          if view_description:
+                              item["ViewDescription"] = view_description
+
+                          _write_to_dynamodb(item)
+
+                      processed += 1
+                      logger.info("Wrote %d pair(s) for view %s.", len(pairs), view_id)
+
+                  except ClientError as e:
+                      errors += 1
+                      logger.error("describe_view failed for %s: %s: %s", view_arn, type(e).__name__, str(e))
+                  except Exception as e:
+                      errors += 1
+                      logger.error("Error processing view %s: %s: %s", view_arn, type(e).__name__, str(e))
+
+              logger.info("Complete: processed=%d, errors=%d", processed, errors)
+              return {"processed": processed, "errors": errors}
+
+  # ---- Allow Amazon Connect to invoke the Lambda ----
+  ConnectInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NormalizeViewDataFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: connect.amazonaws.com
+      SourceArn: !Ref ConnectInstanceArn
+
+  # ---- Associate Lambda with the Connect instance ----
+  ConnectLambdaAssociation:
+    Type: AWS::Connect::IntegrationAssociation
+    DependsOn: ConnectInvokePermission
+    Properties:
+      InstanceId: !Ref ConnectInstanceArn
+      IntegrationType: LAMBDA_FUNCTION
+      IntegrationArn: !GetAtt NormalizeViewDataFunction.Arn
+
+  # ====================================================================
+  # EventBridge Scheduler — daily extraction of View questions
+  # ====================================================================
+
+  # ---- IAM Role for EventBridge Scheduler ----
+  ExtractViewQuestionsSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${DynamoDBTableName}-SchedulerRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ExtractViewQuestionsFunction.Arn
+
+  # ====================================================================
+  # Custom Resource — invoke ExtractViewQuestions on every deployment
+  # ====================================================================
+
+  # ---- IAM Role for the trigger Lambda ----
+  TriggerExtractRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${DynamoDBTableName}-TriggerExtractRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ExtractViewQuestionsFunction.Arn
+
+  # ---- Trigger Lambda (Custom Resource provider) ----
+  TriggerExtractFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${DynamoDBTableName}-TriggerExtract"
+      Description: Custom Resource that invokes ExtractViewQuestions on stack deploy.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt TriggerExtractRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      props = event["ResourceProperties"]
+                      client = boto3.client("lambda")
+                      resp = client.invoke(
+                          FunctionName=props["FunctionName"],
+                          InvocationType="RequestResponse",
+                          Payload=json.dumps({"InstanceId": props["InstanceId"]}),
+                      )
+                      payload = json.loads(resp["Payload"].read())
+                      print(f"ExtractViewQuestions result: {payload}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Error": str(e)})
+
+  # ---- Custom Resource: trigger on every deploy ----
+  TriggerExtractViewQuestions:
+    Type: Custom::TriggerExtract
+    DependsOn:
+      - ExtractViewQuestionsFunction
+      - ViewQuestionsTable
+    Properties:
+      ServiceToken: !GetAtt TriggerExtractFunction.Arn
+      FunctionName: !GetAtt ExtractViewQuestionsFunction.Arn
+      InstanceId: !Select [1, !Split ["/", !Ref ConnectInstanceArn]]
+
+  # ---- EventBridge Scheduler Schedule ----
+  ExtractViewQuestionsSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${DynamoDBTableName}-ExtractViewQuestions-Scheduled"
+      Description: Scheduled extraction of questions/labels from Amazon Connect Views.
+      ScheduleExpression: !Ref ScheduleExpression
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt ExtractViewQuestionsFunction.Arn
+        RoleArn: !GetAtt ExtractViewQuestionsSchedulerRole.Arn
+        Input: !Sub
+          - '{"InstanceId": "${InstanceId}"}'
+          - InstanceId: !Select [1, !Split ["/", !Ref ConnectInstanceArn]]
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function (use this in your Connect flow).
+    Value: !GetAtt NormalizeViewDataFunction.Arn
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table.
+    Value: !Ref ViewDataTable
+
+  LambdaRoleArn:
+    Description: ARN of the Lambda execution role.
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+  ExtractViewQuestionsFunctionArn:
+    Description: ARN of the Extract View Questions Lambda function.
+    Value: !GetAtt ExtractViewQuestionsFunction.Arn
+
+  ViewQuestionsTableName:
+    Description: Name of the View Questions DynamoDB table.
+    Value: !Ref ViewQuestionsTable
+
+  ExtractViewQuestionsScheduleName:
+    Description: Name of the EventBridge Scheduler schedule.
+    Value: !Ref ExtractViewQuestionsSchedule
