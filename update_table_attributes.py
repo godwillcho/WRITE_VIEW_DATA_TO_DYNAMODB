@@ -1,19 +1,18 @@
 """
-Lambda Function: Update DynamoDB Table Attribute Values
+Script: Update DynamoDB Table Attribute Values
 
 Scans a DynamoDB table and updates specific attribute values based on a
 provided mapping. Only updates records that actually contain the attribute.
 
-Event format:
-{
-  "TableName": "ConnectViewData",
-  "DryRun": false
-}
-
-Set DryRun to true to see what would be updated without making changes.
+Usage:
+  python update_table_attributes.py                     # dry run (default)
+  python update_table_attributes.py --apply             # apply changes
+  python update_table_attributes.py --table MyTable     # specify table name
+  python update_table_attributes.py --pk MyPartitionKey # specify partition key name
+  python update_table_attributes.py --region us-east-1  # specify AWS region
 """
 
-import os
+import argparse
 import logging
 from typing import Any, Dict
 
@@ -21,14 +20,11 @@ import boto3
 from botocore.exceptions import ClientError
 
 # ---------- Logging ----------
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
-    logger.addHandler(handler)
-logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
-
-_dynamodb = boto3.resource("dynamodb")
 
 # ---------- Attribute Value Overrides ----------
 # Keys = attribute names to look for in each item
@@ -39,27 +35,20 @@ ATTRIBUTE_OVERRIDES: Dict[str, str] = {
 }
 
 
-def lambda_handler(event, context):
+def update_table(table_name: str, pk_name: str, dry_run: bool, region: str) -> Dict[str, Any]:
     """Scan the table and update matching attributes."""
-    table_name = event.get("TableName") or os.getenv("DDB_TABLE_NAME")
-    dry_run = event.get("DryRun", False)
-    pk_name = event.get("PartitionKeyName") or os.getenv("DDB_PK_NAME", "InitialContactId")
-
-    if not table_name:
-        logger.error("No TableName provided in event or DDB_TABLE_NAME env var.")
-        return {"error": "TableName is required"}
-
     if not ATTRIBUTE_OVERRIDES:
         logger.warning("ATTRIBUTE_OVERRIDES is empty. Nothing to update.")
         return {"scanned": 0, "updated": 0, "errors": 0}
 
-    table = _dynamodb.Table(table_name)
+    dynamodb = boto3.resource("dynamodb", region_name=region)
+    table = dynamodb.Table(table_name)
     scanned = 0
     updated = 0
     errors = 0
 
-    logger.info("Starting scan: table=%s, overrides=%d, dry_run=%s",
-                table_name, len(ATTRIBUTE_OVERRIDES), dry_run)
+    logger.info("Starting scan: table=%s, region=%s, overrides=%d, dry_run=%s",
+                table_name, region, len(ATTRIBUTE_OVERRIDES), dry_run)
 
     scan_kwargs: Dict[str, Any] = {}
     while True:
@@ -128,3 +117,19 @@ def lambda_handler(event, context):
     logger.info("Complete: scanned=%d, updated=%d, errors=%d, dry_run=%s",
                 scanned, updated, errors, dry_run)
     return {"scanned": scanned, "updated": updated, "errors": errors, "dry_run": dry_run}
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Update DynamoDB table attribute values in bulk.")
+    parser.add_argument("--table", default="ConnectViewData", help="DynamoDB table name (default: ConnectViewData)")
+    parser.add_argument("--pk", default="InitialContactId", help="Partition key name (default: InitialContactId)")
+    parser.add_argument("--region", default="us-west-2", help="AWS region (default: us-west-2)")
+    parser.add_argument("--apply", action="store_true", help="Apply changes. Without this flag, runs in dry-run mode.")
+    args = parser.parse_args()
+
+    dry_run = not args.apply
+    if dry_run:
+        print("Running in DRY RUN mode. Use --apply to make changes.\n")
+
+    result = update_table(args.table, args.pk, dry_run, args.region)
+    print(f"\nResult: {result}")
