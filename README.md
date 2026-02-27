@@ -93,23 +93,61 @@ Extracts question labels from Amazon Connect View templates:
 | `LogLevel` | `INFO` | Lambda log level (DEBUG/INFO/WARNING/ERROR) |
 | `ScheduleExpression` | `rate(30 days)` | EventBridge Scheduler expression |
 
+## Label Overrides
+
+The `ExtractViewQuestions` Lambda supports overriding the label for specific `Name` values. Instead of using the label extracted from the View template, you can specify a custom label in the `LABEL_OVERRIDES` dictionary.
+
+Edit the dictionary in both `extract_view_questions.py` and the inline copy in `template.yaml`:
+
+```python
+LABEL_OVERRIDES: Dict[str, str] = {
+    "WelcomeGuide_Q4_Yes": "Accepted - Welcome Guide Q4",
+    "WelcomeGuide_Q4_No": "Declined - Welcome Guide Q4",
+}
+```
+
+Names not in the dictionary keep their original labels from the View template.
+
 ## Deployment
 
 ### Prerequisites
 
-- AWS CLI configured with appropriate credentials
-- An Amazon Connect instance
+- AWS CLI installed and configured with appropriate credentials
+- An existing Amazon Connect instance
 
 ### Deploy the stack
 
 ```bash
 aws cloudformation deploy \
   --template-file template.yaml \
-  --stack-name ConnectViewData \
-  --parameter-overrides \
-    ConnectInstanceArn=arn:aws:connect:us-west-2:123456789012:instance/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  --stack-name write-amazon-connect-view-data-to-dynamodb \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region us-west-2
+  --parameter-overrides \
+    ConnectInstanceArn="arn:aws:connect:us-east-1:123456789012:instance/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
+    DynamoDBTableName="ConnectViewData" \
+    PartitionKeyName="InitialContactId" \
+    TZOffsetHours=-5 \
+    TZLabel="EST" \
+    LogLevel="INFO" \
+    ScheduleExpression="rate(30 days)"
+```
+
+Replace `ConnectInstanceArn` with your actual Connect instance ARN. All other parameters have defaults and are optional.
+
+### What happens on deploy
+
+1. Two DynamoDB tables are created (`ViewDataTable` + `ViewQuestionsTable`).
+2. Two Lambdas are created (`NormalizeViewData` + `ExtractViewQuestions`).
+3. The `NormalizeViewData` Lambda is automatically associated with your Connect instance.
+4. The `ExtractViewQuestions` Lambda runs immediately via the Custom Resource (populates the questions table).
+5. An EventBridge schedule is created to re-run extraction every 30 days.
+
+### Get stack outputs
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name write-amazon-connect-view-data-to-dynamodb \
+  --query "Stacks[0].Outputs"
 ```
 
 ### Use in a Connect flow
