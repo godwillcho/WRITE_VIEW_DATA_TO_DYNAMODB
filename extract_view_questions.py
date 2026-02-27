@@ -51,6 +51,14 @@ _TZ_LABEL = os.getenv("TZ_LABEL", "EST")
 _dynamodb = boto3.resource("dynamodb") if _DDB_TABLE else None
 _connect_client = boto3.client("connect")
 
+# ---------- Label Overrides ----------
+# Map specific Name values to a custom Label.
+# If a Name extracted from a View template matches a key here,
+# the override Label will be used instead of the one from the template.
+LABEL_OVERRIDES: Dict[str, str] = {
+    # "WelcomeGuide_Q4_Yes": "Custom label here",
+}
+
 
 def extract_name_label_pairs(data: Any) -> List[Dict[str, str]]:
     """Recursively walk the View template and collect Name+Label pairs.
@@ -172,9 +180,10 @@ def lambda_handler(event, context):
             view_description = view.get("Description")
 
             for pair in pairs:
+                label = LABEL_OVERRIDES.get(pair["Name"], pair["Label"])
                 item: Dict[str, Any] = {
                     _DDB_PK: pair["Name"],
-                    _DDB_SK: pair["Label"],
+                    _DDB_SK: label,
                     "ViewId": view_id,
                     "ViewArn": view_arn,
                     "CreatedAt": created_at,
