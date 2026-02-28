@@ -159,17 +159,113 @@ After deployment, the `NormalizeViewData` Lambda is automatically registered wit
 3. Pass `viewResultData` and optionally `viewAction` as parameters.
 4. The Lambda returns normalized attributes as key-value pairs usable as contact attributes.
 
+## Utility Scripts
+
+### Enable Case Event Streams for Contact Lens Rules
+
+`enable_case_event_streams.py` follows the [AWS documentation](https://docs.aws.amazon.com/connect/latest/adminguide/cases-rules-integration-onboarding.html) to allow Amazon Connect Cases to send updates to Contact Lens rules. It performs three steps:
+
+1. **Enable case event streams** — configures Cases to publish events to EventBridge via `put_case_event_configuration`
+2. **Create an event integration** — creates an AppIntegrations event integration for `aws.cases` events
+3. **Associate the integration** — links the event integration to your Connect instance so Contact Lens rules can use `OnCaseCreate`, `OnCaseUpdate`, and `OnSlaBreach` triggers
+
+#### Usage
+
+```bash
+# Full setup (all 3 steps)
+python enable_case_event_streams.py \
+  --instance-id YOUR_CONNECT_INSTANCE_ID \
+  --domain-id YOUR_CASES_DOMAIN_ID \
+  --region us-west-2
+
+# Include custom case fields in event payloads
+python enable_case_event_streams.py \
+  --instance-id YOUR_CONNECT_INSTANCE_ID \
+  --domain-id YOUR_CASES_DOMAIN_ID \
+  --region us-west-2 \
+  --extra-fields my_custom_field_1 my_custom_field_2
+
+# List all available case fields for your domain
+python enable_case_event_streams.py \
+  --instance-id YOUR_CONNECT_INSTANCE_ID \
+  --domain-id YOUR_CASES_DOMAIN_ID \
+  --region us-west-2 \
+  --list-fields
+
+# Optional: also route case events to an SQS queue
+python enable_case_event_streams.py \
+  --instance-id YOUR_CONNECT_INSTANCE_ID \
+  --domain-id YOUR_CASES_DOMAIN_ID \
+  --region us-west-2 \
+  --create-sqs-route
+```
+
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--instance-id` | *(required)* | Amazon Connect instance ID |
+| `--domain-id` | *(required)* | Amazon Connect Cases domain ID |
+| `--region` | `us-west-2` | AWS region |
+| `--extra-fields` | none | Additional case field IDs to include in events |
+| `--list-fields` | off | List available fields and exit |
+| `--create-sqs-route` | off | Also create EventBridge → SQS route (not needed for Contact Lens rules) |
+| `--integration-name` | `amazon-connect-cases` | Custom name for the event integration |
+
+#### Required IAM Permissions
+
+- `cases:PutCaseEventConfiguration`, `cases:GetCaseEventConfiguration`, `cases:ListFields`
+- `app-integrations:CreateEventIntegration`, `app-integrations:GetEventIntegration`
+- `connect:CreateIntegrationAssociation`, `connect:ListIntegrationAssociations`
+- (Optional for SQS) `sqs:CreateQueue`, `sqs:GetQueueUrl`, `sqs:GetQueueAttributes`, `events:PutRule`, `events:PutTargets`, `sts:GetCallerIdentity`
+
+### Update DynamoDB Table Attributes
+
+`update_table_attributes.py` is an ad-hoc CLI script for bulk-updating specific attribute values in a DynamoDB table.
+
+#### Usage
+
+```bash
+# Dry run (default — no changes applied)
+python update_table_attributes.py
+
+# Apply changes
+python update_table_attributes.py --apply
+
+# Specify table, partition key, and region
+python update_table_attributes.py --table MyTable --pk MyPartitionKey --region us-east-1
+```
+
+Edit the `ATTRIBUTE_OVERRIDES` dictionary in the script to define which attributes to update:
+
+```python
+ATTRIBUTE_OVERRIDES: Dict[str, str] = {
+    "WelcomeGuide_Q4_Yes": "Your custom label here",
+    "WelcomeGuide_Q4_No": "Another custom label",
+}
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--table` | `ConnectViewData` | DynamoDB table name |
+| `--pk` | `InitialContactId` | Partition key name |
+| `--region` | `us-west-2` | AWS region |
+| `--apply` | off | Apply changes (without this flag, runs in dry-run mode) |
+
 ## File Structure
 
 ```
-├── template.yaml                    # CloudFormation template (all resources inline)
-├── extract_view_questions.py        # Standalone ExtractViewQuestions Lambda source
-├── test.py                          # Standalone NormalizeViewData Lambda source
-├── test_extract_views_event.json    # Sample test event for ExtractViewQuestions
+├── template.yaml                        # CloudFormation template (all resources inline)
+├── extract_view_questions.py            # Standalone ExtractViewQuestions Lambda source
+├── test.py                              # Standalone NormalizeViewData Lambda source
+├── enable_case_event_streams.py         # Enable case event streams for Contact Lens rules
+├── test_enable_case_event_streams.py    # Tests for enable_case_event_streams.py
+├── update_table_attributes.py           # Ad-hoc bulk attribute updater for DynamoDB
+├── test_extract_views_event.json        # Sample test event for ExtractViewQuestions
 └── README.md
 ```
 
-> **Note**: The Lambda code is deployed inline via CloudFormation `ZipFile`. The standalone `.py` files are kept in sync for local development and testing.
+> **Note**: The Lambda code is deployed inline via CloudFormation `ZipFile`. The standalone `.py` files are kept in sync for local development and testing. The utility scripts (`enable_case_event_streams.py`, `update_table_attributes.py`) are standalone CLI tools and are not part of the CloudFormation stack.
 
 ## Testing
 
@@ -191,4 +287,10 @@ aws lambda invoke \
   --payload file://test_extract_views_event.json \
   --region us-west-2 \
   output.json && cat output.json
+```
+
+### Test enable_case_event_streams.py
+
+```bash
+python -m pytest test_enable_case_event_streams.py -v
 ```
