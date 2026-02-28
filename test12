@@ -1,0 +1,14 @@
+{
+  "channel": "TASK",
+  "reference_number": "06411301",
+  "bc11ce56-2256-48a4-acef-eff7d42fc94b": "referral",
+  "1c37e3d4-285c-4b01-bf4f-77cdaab69243": "referral",
+  "status": "open",
+  "0409d429-113c-4ccb-bf16-f5b1cfa0d642": "Goddy",
+  "title": "Testing 12",
+  "customer_id": "arn:aws:profile:us-east-1:125677696735:domains/amazon-connect-trident-united-way-dev/profiles/9faa3e3ce941473bac25abfa2bc31d8a",
+  "31a2eb09-8088-4b1a-8917-bdfaadc608b2": "78640",
+  "last_updated_datetime": "2026-02-28T20:44:26.607264287Z",
+  "d31de755-d78c-4f50-81d2-793e8dc1c0d3": "Godwill12",
+  "created_datetime": "2026-02-28T20:44:24.191800097Z"
+}
