@@ -1,15 +1,14 @@
 """
-Lambda Function: Process Amazon Connect Contact Flow Events (TASK / CHAT)
+Lambda Function: Process Amazon Connect TASK Contact Flow Events
 
-Invoked from an Amazon Connect contact flow. Routes based on the Channel field:
-- TASK: Extracts the Case ID from the taskRef URL, calls the Cases API
-        (connectcases:GetCase) to retrieve case fields, and sends an SNS
-        notification with all case field data as JSON.
-- CHAT: Extracts contact attributes from the event and sends an SNS
-        notification with all attributes as JSON.
+Invoked from an Amazon Connect contact flow for TASK channel events.
+Extracts the Case ID from the taskRef URL, calls the Cases API
+(connectcases:GetCase) to retrieve all case fields, sends an SNS
+notification with the data as JSON, and returns the case fields
+as flat key-value pairs.
 
 Environment variables:
-  CASES_DOMAIN_ID  - Amazon Connect Cases domain ID (required for TASK processing)
+  CASES_DOMAIN_ID  - Amazon Connect Cases domain ID
   SNS_TOPIC_ARN    - ARN of the SNS topic for email notifications
   LOG_LEVEL        - Logging level (DEBUG | INFO | WARNING | ERROR). Default: INFO
 """
@@ -39,33 +38,47 @@ _SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
 _cases_client = boto3.client("connectcases")
 _sns_client = boto3.client("sns")
 
-# ---------- Case fields to request from the Cases API ----------
-# Built-in fields. Add custom field IDs to CUSTOM_CASE_FIELD_IDS below.
-DEFAULT_CASE_FIELD_IDS = [
-    "status",
-    "title",
-    "assigned_queue",
-    "assigned_user",
-    "case_reason",
-    "last_closed_datetime",
-    "created_datetime",
-    "last_updated_datetime",
-    "reference_number",
-    "summary",
-]
+# ---------- Field name cache ----------
+# Maps field ID -> human-readable field name (populated by _list_all_field_ids)
+_field_name_cache: Dict[str, str] = {}
 
-# Custom case field IDs (add your own field IDs here).
-# Find available field IDs by running:
-#   python enable_case_event_streams.py --list-fields --instance-id ... --domain-id ...
-CUSTOM_CASE_FIELD_IDS: List[str] = [
-    # "my_custom_field_1",
-    # "my_custom_field_2",
-]
 
-# Combined list sent to the Cases API
-CASE_FIELD_IDS: List[Dict[str, str]] = [
-    {"id": f} for f in DEFAULT_CASE_FIELD_IDS + CUSTOM_CASE_FIELD_IDS
-]
+def _list_all_field_ids(domain_id: str) -> List[Dict[str, str]]:
+    """Call connectcases:ListFields to discover all field IDs for the domain.
+
+    Returns a list of {"id": field_id} dicts ready to pass to get_case.
+    Also populates _field_name_cache with field_id -> field_name mappings
+    so the response can include human-readable names.
+
+    The get_case API accepts max 220 fields per call.
+    """
+    field_ids: List[Dict[str, str]] = []
+    next_token: Optional[str] = None
+
+    while True:
+        kwargs: Dict[str, Any] = {"domainId": domain_id}
+        if next_token:
+            kwargs["nextToken"] = next_token
+
+        try:
+            resp = _cases_client.list_fields(**kwargs)
+        except ClientError as e:
+            logger.error("connectcases:ListFields failed: %s: %s", type(e).__name__, str(e))
+            raise
+
+        for field in resp.get("fields", []):
+            fid = field.get("fieldId", "")
+            fname = field.get("name", "")
+            if fid:
+                field_ids.append({"id": fid})
+                _field_name_cache[fid] = fname
+
+        next_token = resp.get("nextToken")
+        if not next_token:
+            break
+
+    logger.info("Discovered %d field(s) for domain %s.", len(field_ids), domain_id)
+    return field_ids
 
 
 def _extract_case_id_from_task_ref(event: Dict[str, Any]) -> Optional[str]:
@@ -132,22 +145,35 @@ def process_task_event(event: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("Processing TASK event: contact_id=%s, case_id=%s, task_name=%s",
                 contact_id, case_id, task_name)
 
-    # Call the Cases API to get case field values
-    try:
-        response = _cases_client.get_case(
-            domainId=_CASES_DOMAIN_ID,
-            caseId=case_id,
-            fields=CASE_FIELD_IDS,
-        )
-    except ClientError as e:
-        logger.error("connectcases:GetCase failed for case %s: %s: %s",
-                     case_id, type(e).__name__, str(e))
-        raise
+    # Step 1: Discover all fields for this domain
+    all_field_ids = _list_all_field_ids(_CASES_DOMAIN_ID)
+    if not all_field_ids:
+        raise ValueError(f"No fields found for domain {_CASES_DOMAIN_ID}.")
 
-    # Parse the response: fields come back as a list of {id, value} dicts.
-    # The value is a tagged union with one of:
-    # stringValue, doubleValue, booleanValue, emptyValue, userArnValue
-    raw_fields = response.get("fields", [])
+    # Step 2: Call get_case with all discovered fields.
+    # The API accepts max 220 fields per call, so batch if needed.
+    raw_fields: List[Dict[str, Any]] = []
+    batch_size = 220
+    for i in range(0, len(all_field_ids), batch_size):
+        batch = all_field_ids[i:i + batch_size]
+        try:
+            response = _cases_client.get_case(
+                domainId=_CASES_DOMAIN_ID,
+                caseId=case_id,
+                fields=batch,
+            )
+            raw_fields.extend(response.get("fields", []))
+        except ClientError as e:
+            logger.error("connectcases:GetCase failed for case %s: %s: %s",
+                         case_id, type(e).__name__, str(e))
+            raise
+
+    # Also capture the templateId from the last response
+    template_id = response.get("templateId", "") if raw_fields else ""
+
+    # Step 3: Parse field values.
+    # The value is a tagged union: stringValue, doubleValue, booleanValue,
+    # emptyValue, or userArnValue.
     fields: Dict[str, Any] = {}
     for field in raw_fields:
         field_id = field.get("id", "")
@@ -166,49 +192,33 @@ def process_task_event(event: Dict[str, Any]) -> Dict[str, Any]:
             fields[field_id] = str(value_obj)
             logger.warning("Unknown value type for field %s: %s", field_id, value_obj)
 
+    # Build a human-readable field_names mapping from the cache
+    field_names: Dict[str, str] = {}
+    for fid in fields:
+        if fid in _field_name_cache:
+            field_names[fid] = _field_name_cache[fid]
+
     result = {
         "channel": "TASK",
         "contact_id": contact_id,
         "case_id": case_id,
         "task_name": task_name,
+        "template_id": template_id,
         "fields": fields,
+        "field_names": field_names,
     }
 
-    logger.info("TASK processing complete: case_id=%s, fields_count=%d", case_id, len(fields))
+    logger.info("TASK processing complete: case_id=%s, fields_count=%d (of %d discovered)",
+                case_id, len(fields), len(all_field_ids))
     return result
 
 
-def process_chat_event(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Process a CHAT channel event: extract contact attributes.
-
-    Returns a dict with:
-      - channel: "CHAT"
-      - contact_id: the ContactId from the event
-      - fields: dict of contact attributes from ContactData.Attributes
-    """
-    contact_data = event.get("Details", {}).get("ContactData", {})
-    contact_id = contact_data.get("ContactId", "")
-    attributes = contact_data.get("Attributes", {})
-
-    logger.info("Processing CHAT event: contact_id=%s, attributes_count=%d",
-                contact_id, len(attributes))
-
-    result = {
-        "channel": "CHAT",
-        "contact_id": contact_id,
-        "fields": attributes,
-    }
-
-    logger.info("CHAT processing complete: contact_id=%s, fields_count=%d",
-                contact_id, len(attributes))
-    return result
-
-
-def send_sns_notification(data: Dict[str, Any], sns_topic_arn: str) -> Optional[str]:
-    """Publish a notification to SNS with the contact/case data as JSON.
+def send_sns_notification(result: Dict[str, str], contact_id: str, sns_topic_arn: str) -> Optional[str]:
+    """Publish a notification to SNS with the flat result data as JSON.
 
     Args:
-        data: The dict returned by process_task_event or process_chat_event.
+        result: The flat key-value dict (same structure returned to Connect).
+        contact_id: The ContactId for the SNS subject line.
         sns_topic_arn: ARN of the SNS topic to publish to.
 
     Returns:
@@ -218,15 +228,12 @@ def send_sns_notification(data: Dict[str, Any], sns_topic_arn: str) -> Optional[
         logger.warning("SNS topic ARN not configured; skipping notification.")
         return None
 
-    channel = data.get("channel", "UNKNOWN")
-    contact_id = data.get("contact_id", "unknown")
-
-    subject = f"Amazon Connect {channel} - Contact {contact_id}"
+    subject = f"Amazon Connect TASK - Contact {contact_id}"
     # SNS email subject max is 100 characters
     if len(subject) > 100:
         subject = subject[:97] + "..."
 
-    message_body = json.dumps(data, indent=2, default=str)
+    message_body = json.dumps(result, indent=2, default=str)
 
     try:
         response = _sns_client.publish(
@@ -235,8 +242,8 @@ def send_sns_notification(data: Dict[str, Any], sns_topic_arn: str) -> Optional[
             Message=message_body,
         )
         message_id = response.get("MessageId", "")
-        logger.info("SNS notification sent: message_id=%s, topic=%s, channel=%s, contact=%s",
-                     message_id, sns_topic_arn, channel, contact_id)
+        logger.info("SNS notification sent: message_id=%s, topic=%s, contact=%s",
+                     message_id, sns_topic_arn, contact_id)
         return message_id
     except ClientError as e:
         logger.error("SNS publish failed: %s: %s", type(e).__name__, str(e))
@@ -247,62 +254,38 @@ def send_sns_notification(data: Dict[str, Any], sns_topic_arn: str) -> Optional[
 
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Main entry point: route based on Channel, process, and notify via SNS.
+    """Main entry point: process TASK event, notify via SNS, return flat data.
 
-    Invoked from an Amazon Connect contact flow. Determines the channel
-    (TASK or CHAT) from the event, extracts the relevant data, publishes
-    an SNS notification, and returns the extracted data to the flow.
+    Invoked from an Amazon Connect contact flow. Extracts case fields,
+    publishes an SNS notification, and returns all case fields plus the
+    channel and SNS message ID as flat key-value pairs.
     """
     try:
         contact_data = event.get("Details", {}).get("ContactData", {})
-        channel = contact_data.get("Channel", "")
         contact_id = contact_data.get("ContactId", "unknown")
 
-        logger.info("Lambda invoked: channel=%s, contact_id=%s", channel, contact_id)
+        logger.info("Lambda invoked: contact_id=%s", contact_id)
 
-        if channel == "TASK":
-            data = process_task_event(event)
-        elif channel == "CHAT":
-            data = process_chat_event(event)
-        else:
-            logger.error("Unsupported channel: %s for contact %s", channel, contact_id)
-            return {
-                "status": "error",
-                "error": f"Unsupported channel: {channel}",
-                "contact_id": contact_id,
-            }
+        data = process_task_event(event)
 
-        # Send SNS notification
-        message_id = send_sns_notification(data, _SNS_TOPIC_ARN)
-
-        # Return the data to the Connect flow as flat key-value pairs
-        result: Dict[str, str] = {
-            "status": "success",
-            "channel": data.get("channel", ""),
-            "contact_id": data.get("contact_id", ""),
-            "sns_message_id": message_id or "not_sent",
-        }
-        if "case_id" in data:
-            result["case_id"] = data["case_id"]
-        if "task_name" in data:
-            result["task_name"] = data["task_name"]
-
-        # Flatten fields into the return value for Connect contact attributes.
-        # Prefix with "case_" or "chat_" to avoid collisions with top-level keys
-        # like "status" and "channel".
-        prefix = "case_" if channel == "TASK" else "chat_"
+        # Build flat key-value result from case fields
+        result: Dict[str, str] = {"channel": "TASK"}
         for key, value in data.get("fields", {}).items():
-            result[f"{prefix}{key}"] = str(value) if value is not None else ""
+            result[key] = str(value) if value is not None else ""
 
-        logger.info("Lambda complete: channel=%s, contact_id=%s, fields=%d, sns=%s",
-                     channel, contact_id, len(data.get("fields", {})),
+        # Send the flat result as the SNS message, then add sns_message_id
+        message_id = send_sns_notification(result, contact_id, _SNS_TOPIC_ARN)
+        result["sns_message_id"] = message_id or "not_sent"
+
+        logger.info("Lambda complete: contact_id=%s, fields=%d, sns=%s",
+                     contact_id, len(data.get("fields", {})),
                      "sent" if message_id else "skipped")
         return result
 
     except ValueError as e:
         logger.error("Validation error: %s: %s", type(e).__name__, str(e))
         return {
-            "status": "error",
+            "channel": "TASK",
             "error": str(e),
         }
     except Exception as e:
