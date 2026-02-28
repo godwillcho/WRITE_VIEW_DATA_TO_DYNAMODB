@@ -219,6 +219,61 @@ python enable_case_event_streams.py \
 - `connect:CreateIntegrationAssociation`, `connect:ListIntegrationAssociations`
 - (Optional for SQS) `sqs:CreateQueue`, `sqs:GetQueueUrl`, `sqs:GetQueueAttributes`, `events:PutRule`, `events:PutTargets`, `sts:GetCallerIdentity`
 
+### Process Contact Flow Event Lambda (TASK / CHAT)
+
+`process_contact_flow_event.py` is a standalone Lambda function invoked from an Amazon Connect contact flow. It routes based on the contact channel:
+
+- **TASK**: Extracts the Case ID from the `taskRef` URL in the event, calls the Cases API (`connectcases:GetCase`) to retrieve case field values, and sends an SNS email notification with all data as JSON.
+- **CHAT**: Extracts contact attributes from the event and sends an SNS email notification with all attributes as JSON.
+
+#### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CASES_DOMAIN_ID` | Yes (for TASK) | Amazon Connect Cases domain ID |
+| `SNS_TOPIC_ARN` | Yes (for notifications) | ARN of the SNS topic for email notifications |
+| `LOG_LEVEL` | No (default: `INFO`) | Logging level (DEBUG/INFO/WARNING/ERROR) |
+
+#### Custom Case Fields
+
+To include custom case fields in TASK event processing, add field IDs to the `CUSTOM_CASE_FIELD_IDS` list in the script:
+
+```python
+CUSTOM_CASE_FIELD_IDS: List[str] = [
+    "my_custom_field_1",
+    "my_custom_field_2",
+]
+```
+
+Find available field IDs by running:
+
+```bash
+python enable_case_event_streams.py --list-fields --instance-id YOUR_ID --domain-id YOUR_DOMAIN
+```
+
+#### Return Value
+
+The Lambda returns a flat dict usable as Connect contact attributes. Case fields are prefixed with `case_` and chat attributes with `chat_` to avoid key collisions:
+
+```json
+{
+  "status": "success",
+  "channel": "TASK",
+  "contact_id": "54af2d58-...",
+  "case_id": "de4d7f2d-...",
+  "sns_message_id": "msg-12345",
+  "case_title": "Incorrect Shipping Address",
+  "case_status": "Open",
+  "case_reference_number": "100123.0"
+}
+```
+
+#### Required IAM Permissions
+
+- `cases:GetCase` on the Cases domain
+- `sns:Publish` on the SNS topic
+- `AWSLambdaBasicExecutionRole` for CloudWatch Logs
+
 ### Update DynamoDB Table Attributes
 
 `update_table_attributes.py` is an ad-hoc CLI script for bulk-updating specific attribute values in a DynamoDB table.
@@ -255,17 +310,19 @@ ATTRIBUTE_OVERRIDES: Dict[str, str] = {
 ## File Structure
 
 ```
-├── template.yaml                        # CloudFormation template (all resources inline)
-├── extract_view_questions.py            # Standalone ExtractViewQuestions Lambda source
-├── test.py                              # Standalone NormalizeViewData Lambda source
-├── enable_case_event_streams.py         # Enable case event streams for Contact Lens rules
-├── test_enable_case_event_streams.py    # Tests for enable_case_event_streams.py
-├── update_table_attributes.py           # Ad-hoc bulk attribute updater for DynamoDB
-├── test_extract_views_event.json        # Sample test event for ExtractViewQuestions
+├── template.yaml                            # CloudFormation template (all resources inline)
+├── extract_view_questions.py                # Standalone ExtractViewQuestions Lambda source
+├── test.py                                  # Standalone NormalizeViewData Lambda source
+├── process_contact_flow_event.py            # TASK/CHAT contact flow Lambda (Cases + SNS)
+├── test_process_contact_flow_event.py       # Tests for process_contact_flow_event.py
+├── enable_case_event_streams.py             # Enable case event streams for Contact Lens rules
+├── test_enable_case_event_streams.py        # Tests for enable_case_event_streams.py
+├── update_table_attributes.py               # Ad-hoc bulk attribute updater for DynamoDB
+├── test_extract_views_event.json            # Sample test event for ExtractViewQuestions
 └── README.md
 ```
 
-> **Note**: The Lambda code is deployed inline via CloudFormation `ZipFile`. The standalone `.py` files are kept in sync for local development and testing. The utility scripts (`enable_case_event_streams.py`, `update_table_attributes.py`) are standalone CLI tools and are not part of the CloudFormation stack.
+> **Note**: The Lambda code for NormalizeViewData and ExtractViewQuestions is deployed inline via CloudFormation `ZipFile`. The standalone `.py` files are kept in sync for local development and testing. The utility scripts (`enable_case_event_streams.py`, `update_table_attributes.py`) and the contact flow Lambda (`process_contact_flow_event.py`) are standalone files not part of the CloudFormation stack.
 
 ## Testing
 
@@ -293,4 +350,10 @@ aws lambda invoke \
 
 ```bash
 python -m pytest test_enable_case_event_streams.py -v
+```
+
+### Test process_contact_flow_event.py
+
+```bash
+python -m pytest test_process_contact_flow_event.py -v
 ```
