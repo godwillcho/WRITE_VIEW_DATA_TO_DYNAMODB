@@ -326,7 +326,7 @@ Resources:
 
                   data = process_task_event(event)
 
-                  result: Dict[str, Any] = {"channel": "TASK"}
+                  result: Dict[str, Any] = {"channel": "TASK", "case_id": data.get("case_id", "")}
                   for key, value in data.get("fields", {}).items():
                       result[key] = value
 

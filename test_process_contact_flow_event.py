@@ -307,6 +307,7 @@ class TestLambdaHandler(unittest.TestCase):
         result = lambda_handler(TASK_EVENT, None)
 
         assert result["channel"] == "TASK"
+        assert result["case_id"] == "de4d7f2d-592d-3b68-908d-d09e5dc93471"
         assert result["sns_message_id"] == "msg-abc"
         # Case fields use human-readable names as keys
         assert result["Title"] == "Incorrect Shipping Address"
@@ -319,6 +320,7 @@ class TestLambdaHandler(unittest.TestCase):
         mock_sns.publish.assert_called_once()
         sns_body = json.loads(mock_sns.publish.call_args[1]["Message"])
         assert sns_body["channel"] == "TASK"
+        assert sns_body["case_id"] == "de4d7f2d-592d-3b68-908d-d09e5dc93471"
         assert sns_body["Title"] == "Incorrect Shipping Address"
         assert sns_body["Status"] == "Open"
         assert "sns_message_id" not in sns_body
@@ -340,6 +342,7 @@ class TestLambdaHandler(unittest.TestCase):
         result = lambda_handler(TASK_EVENT, None)
 
         assert result["channel"] == "TASK"
+        assert result["case_id"] == "de4d7f2d-592d-3b68-908d-d09e5dc93471"
         assert result["sns_message_id"] == "not_sent"
         assert result["Title"] == "Incorrect Shipping Address"
         assert result["Status"] == "Open"

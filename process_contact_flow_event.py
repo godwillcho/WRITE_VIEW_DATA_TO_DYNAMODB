@@ -268,7 +268,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         data = process_task_event(event)
 
         # Build flat result from case fields (field names as keys, None for empty)
-        result: Dict[str, Any] = {"channel": "TASK"}
+        result: Dict[str, Any] = {"channel": "TASK", "case_id": data.get("case_id", "")}
         for key, value in data.get("fields", {}).items():
             result[key] = value
 
