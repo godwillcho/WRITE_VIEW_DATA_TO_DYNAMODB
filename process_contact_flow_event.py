@@ -171,32 +171,32 @@ def process_task_event(event: Dict[str, Any]) -> Dict[str, Any]:
     # Also capture the templateId from the last response
     template_id = response.get("templateId", "") if raw_fields else ""
 
-    # Step 3: Parse field values.
+    # Step 3: Parse field values using human-readable field names as keys.
     # The value is a tagged union: stringValue, doubleValue, booleanValue,
     # emptyValue, or userArnValue.
     fields: Dict[str, Any] = {}
     for field in raw_fields:
         field_id = field.get("id", "")
+        field_name = _field_name_cache.get(field_id, field_id)
         value_obj = field.get("value", {})
         if "stringValue" in value_obj:
-            fields[field_id] = value_obj["stringValue"]
+            fields[field_name] = value_obj["stringValue"]
         elif "doubleValue" in value_obj:
-            fields[field_id] = value_obj["doubleValue"]
+            fields[field_name] = value_obj["doubleValue"]
         elif "booleanValue" in value_obj:
-            fields[field_id] = value_obj["booleanValue"]
+            fields[field_name] = value_obj["booleanValue"]
         elif "userArnValue" in value_obj:
-            fields[field_id] = value_obj["userArnValue"]
+            fields[field_name] = value_obj["userArnValue"]
         elif "emptyValue" in value_obj:
-            fields[field_id] = None
+            fields[field_name] = None
         else:
-            fields[field_id] = str(value_obj)
-            logger.warning("Unknown value type for field %s: %s", field_id, value_obj)
+            fields[field_name] = str(value_obj)
+            logger.warning("Unknown value type for field %s (%s): %s", field_name, field_id, value_obj)
 
-    # Build a human-readable field_names mapping from the cache
-    field_names: Dict[str, str] = {}
-    for fid in fields:
-        if fid in _field_name_cache:
-            field_names[fid] = _field_name_cache[fid]
+    # Include any discovered fields not returned by get_case as None
+    for _, fname in _field_name_cache.items():
+        if fname not in fields:
+            fields[fname] = None
 
     result = {
         "channel": "TASK",
@@ -205,7 +205,6 @@ def process_task_event(event: Dict[str, Any]) -> Dict[str, Any]:
         "task_name": task_name,
         "template_id": template_id,
         "fields": fields,
-        "field_names": field_names,
     }
 
     logger.info("TASK processing complete: case_id=%s, fields_count=%d (of %d discovered)",
@@ -268,10 +267,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         data = process_task_event(event)
 
-        # Build flat key-value result from case fields
-        result: Dict[str, str] = {"channel": "TASK"}
+        # Build flat result from case fields (field names as keys, None for empty)
+        result: Dict[str, Any] = {"channel": "TASK"}
         for key, value in data.get("fields", {}).items():
-            result[key] = str(value) if value is not None else ""
+            result[key] = value
 
         # Send the flat result as the SNS message, then add sns_message_id
         message_id = send_sns_notification(result, contact_id, _SNS_TOPIC_ARN)

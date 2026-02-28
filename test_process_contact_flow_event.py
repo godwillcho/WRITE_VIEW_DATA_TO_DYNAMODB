@@ -133,21 +133,17 @@ class TestProcessTaskEvent(unittest.TestCase):
         assert result["contact_id"] == "54af2d58-1c85-4586-8c16-1457620e9920"
         assert result["task_name"] == "Action-Required - Cases de4d7f2d-592d-3b68-908d-d09e5dc93471"
         assert result["template_id"] == "template-123"
-        # Built-in fields
-        assert result["fields"]["title"] == "Incorrect Shipping Address"
-        assert result["fields"]["status"] == "Open"
-        assert result["fields"]["reference_number"] == 100123.0
-        assert result["fields"]["summary"] is None  # emptyValue
-        assert "arn:aws:connect" in result["fields"]["assigned_user"]  # userArnValue
-        # Custom field discovered dynamically
-        assert result["fields"]["custom_priority"] == "High"
-        # Field names mapping
-        assert result["field_names"]["title"] == "Title"
-        assert result["field_names"]["custom_priority"] == "Priority Level"
-        # list_fields was called to discover fields
+        # Fields keyed by human-readable name (not field ID)
+        assert result["fields"]["Title"] == "Incorrect Shipping Address"
+        assert result["fields"]["Status"] == "Open"
+        assert result["fields"]["Reference Number"] == 100123.0
+        assert result["fields"]["Summary"] is None  # emptyValue
+        assert "arn:aws:connect" in result["fields"]["Assigned User"]  # userArnValue
+        # Custom field uses its name, not UUID
+        assert result["fields"]["Priority Level"] == "High"
         mock_cases.list_fields.assert_called_once()
         mock_cases.get_case.assert_called_once()
-        print("PASS: discovers all fields dynamically and returns values with names")
+        print("PASS: discovers all fields and returns human-readable names as keys")
 
     @patch("process_contact_flow_event._cases_client")
     @patch("process_contact_flow_event._CASES_DOMAIN_ID", "domain-123")
@@ -312,23 +308,23 @@ class TestLambdaHandler(unittest.TestCase):
 
         assert result["channel"] == "TASK"
         assert result["sns_message_id"] == "msg-abc"
-        # Case fields flattened directly — status is the case status, not metadata
-        assert result["title"] == "Incorrect Shipping Address"
-        assert result["status"] == "Open"
-        assert result["reference_number"] == "100123.0"
-        assert result["summary"] == ""  # emptyValue -> empty string
-        assert result["custom_priority"] == "High"
-        assert "arn:aws:connect" in result["assigned_user"]
+        # Case fields use human-readable names as keys
+        assert result["Title"] == "Incorrect Shipping Address"
+        assert result["Status"] == "Open"
+        assert result["Reference Number"] == 100123.0
+        assert result["Summary"] is None  # emptyValue -> None
+        assert result["Priority Level"] == "High"
+        assert "arn:aws:connect" in result["Assigned User"]
         # SNS message body is the same flat structure (without sns_message_id)
         mock_sns.publish.assert_called_once()
         sns_body = json.loads(mock_sns.publish.call_args[1]["Message"])
         assert sns_body["channel"] == "TASK"
-        assert sns_body["title"] == "Incorrect Shipping Address"
-        assert sns_body["status"] == "Open"
+        assert sns_body["Title"] == "Incorrect Shipping Address"
+        assert sns_body["Status"] == "Open"
         assert "sns_message_id" not in sns_body
         mock_cases.list_fields.assert_called_once()
         mock_cases.get_case.assert_called_once()
-        print("PASS: TASK event returns and sends same flat key-value structure")
+        print("PASS: TASK event returns field names as keys with None for empty")
 
     @patch("process_contact_flow_event._sns_client")
     @patch("process_contact_flow_event._cases_client")
@@ -345,8 +341,8 @@ class TestLambdaHandler(unittest.TestCase):
 
         assert result["channel"] == "TASK"
         assert result["sns_message_id"] == "not_sent"
-        assert result["title"] == "Incorrect Shipping Address"
-        assert result["status"] == "Open"
+        assert result["Title"] == "Incorrect Shipping Address"
+        assert result["Status"] == "Open"
         mock_sns.publish.assert_not_called()
         print("PASS: TASK event succeeds even without SNS configured")
 
